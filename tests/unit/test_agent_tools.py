@@ -21,6 +21,7 @@ from google.genai import types
 from app.agent import (
     ResearchPlan,
     decline_node,
+    normalize_grounding_metadata_callback,
     route_research,
     search_arxiv,
     search_hackernews,
@@ -91,3 +92,16 @@ def test_search_arxiv_parses_atom_xml() -> None:
         result = search_arxiv("mixture of experts", max_results=2)
     assert "Mixture of Experts Survey" in result
     assert "http://arxiv.org/abs/2401.00001v1" in result
+
+
+def test_normalize_grounding_metadata_callback_coerces_dict() -> None:
+    original = types.GroundingMetadata(web_search_queries=["RAG overview"])
+    dumped_dict = original.model_dump(exclude_none=True)
+    ctx = SimpleNamespace(state={"temp:_adk_grounding_metadata": dumped_dict})
+    normalize_grounding_metadata_callback(ctx, llm_response=None)
+    restored = ctx.state["temp:_adk_grounding_metadata"]
+    assert isinstance(restored, types.GroundingMetadata)
+    assert restored.model_dump(exclude_none=True, mode="json")["web_search_queries"] == [
+        "RAG overview"
+    ]
+

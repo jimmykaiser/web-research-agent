@@ -45,6 +45,27 @@ async def add_session_to_memory_callback(callback_context: CallbackContext):
     return None
 
 
+def normalize_grounding_metadata_callback(
+    callback_context: CallbackContext, llm_response: object
+) -> None:
+    """Coerces dict grounding metadata in temp state back to GroundingMetadata.
+
+    When GoogleSearchTool(bypass_multi_tools_limit=True) runs in parallel with
+    other tools, ADK's merge_parallel_function_response_events dumps
+    EventActions.state_delta via model_dump(), turning
+    temp:_adk_grounding_metadata into a plain dict and causing
+    VertexAiSessionService.append_event to fail on grounding_metadata.model_dump().
+    """
+    del llm_response
+    raw = callback_context.state.get("temp:_adk_grounding_metadata")
+    if isinstance(raw, dict):
+        callback_context.state["temp:_adk_grounding_metadata"] = (
+            types.GroundingMetadata.model_validate(raw)
+        )
+    return None
+
+
+
 class ResearchPlan(BaseModel):
     """Classification and search plan for an incoming user query."""
 
@@ -202,6 +223,7 @@ web_researcher_agent = LlmAgent(
         search_arxiv,
         preload_memory,
     ],
+    after_model_callback=[normalize_grounding_metadata_callback],
     after_agent_callback=[add_session_to_memory_callback],
 )
 
