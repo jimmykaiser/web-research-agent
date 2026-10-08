@@ -1,0 +1,37 @@
+{
+  "eval_cases": [
+    {
+      "eval_case_id": "unrelated_decline",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Hello! Can you tell me a funny knock-knock joke?"
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "tech_research_query",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "What is retrieval-augmented generation (RAG) and what do developers on Hacker News discuss about its trade-offs?"
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "arxiv_paper_search",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Find research papers on arXiv about Mixture of Experts (MoE) language models and summarize them with links."
+          }
+        ]
+      }
+    }
+  ]
+}
