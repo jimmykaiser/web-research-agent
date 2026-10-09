@@ -16,24 +16,37 @@ import io
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from google.adk.events.request_input import RequestInput
 from google.genai import types
 
 from app.agent import (
+    PLANNER_MODEL,
+    RESEARCHER_MODEL,
     ResearchPlan,
+    app,
     decline_node,
     normalize_grounding_metadata_callback,
+    query_planner_agent,
+    requires_exhaustive_search_approval,
     route_research,
     search_arxiv,
     search_hackernews,
+    web_researcher_agent,
 )
 
 
-def _make_fake_ctx(user_text: str):
+def _make_fake_ctx(
+    user_text: str,
+    state: dict | None = None,
+    resume_inputs: dict | None = None,
+):
     return SimpleNamespace(
         user_content=types.Content(
             role="user",
             parts=[types.Part.from_text(text=user_text)],
-        )
+        ),
+        state=state or {},
+        resume_inputs=resume_inputs or {},
     )
 
 
@@ -59,6 +72,41 @@ def test_route_research_unrelated_query() -> None:
     )
     event = route_research(ctx, plan)
     assert event.actions.route == "unrelated"
+
+
+def test_route_research_hitl_pause_and_resume() -> None:
+    plan = ResearchPlan(
+        is_research_query=True,
+        search_queries=[],
+        reasoning="Ambiguous research request missing a subject.",
+        needs_clarification=True,
+        clarification_question="Which two databases would you like me to compare?",
+    )
+    # 1. First execution halts and returns RequestInput
+    pause_ctx = _make_fake_ctx("Compare the two")
+    pause_result = route_research(pause_ctx, plan)
+    assert isinstance(pause_result, RequestInput)
+    assert pause_result.interrupt_id == "clarify_research_scope"
+    assert "Which two databases" in (pause_result.message or "")
+
+    # 2. Resumed execution incorporates human input and routes to researcher
+    resume_ctx = _make_fake_ctx(
+        "Compare the two",
+        resume_inputs={"clarify_research_scope": "PostgreSQL vs DuckDB for analytics"},
+    )
+    resume_event = route_research(resume_ctx, plan)
+    assert resume_event.actions.route == "research"
+    assert "PostgreSQL vs DuckDB for analytics" in resume_event.output
+
+
+def test_strategic_model_routing_and_hitl_tool_gate() -> None:
+    assert query_planner_agent.model.model == PLANNER_MODEL
+    assert web_researcher_agent.model.model == RESEARCHER_MODEL
+    assert PLANNER_MODEL != RESEARCHER_MODEL
+    assert app.resumability_config is not None
+    assert app.resumability_config.is_resumable is True
+    assert requires_exhaustive_search_approval(max_results=3) is False
+    assert requires_exhaustive_search_approval(max_results=10) is True
 
 
 def test_decline_node_message() -> None:

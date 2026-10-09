@@ -22,17 +22,23 @@ import xml.etree.ElementTree as ET
 from google.adk.agents import LlmAgent
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.agents.context import Context
-from google.adk.apps import App
+from google.adk.apps import App, ResumabilityConfig
 from google.adk.events import Event
+from google.adk.events.request_input import RequestInput
 from google.adk.models import Gemini
-from google.adk.tools import preload_memory
+from google.adk.tools import FunctionTool, preload_memory
 from google.adk.tools.google_search_tool import GoogleSearchTool
-from google.adk.workflow import Workflow
+from google.adk.workflow import Workflow, node
 from google.genai import types
 from pydantic import BaseModel, Field
 
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Strategic model routing: lightweight model for fast classification/planning,
+# higher-capacity model for multi-tool research synthesis.
+PLANNER_MODEL = os.getenv("PLANNER_MODEL", "gemini-2.5-flash-lite")
+RESEARCHER_MODEL = os.getenv(
+    "RESEARCHER_MODEL", os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+)
 
 
 async def add_session_to_memory_callback(callback_context: CallbackContext):
@@ -65,7 +71,6 @@ def normalize_grounding_metadata_callback(
     return None
 
 
-
 class ResearchPlan(BaseModel):
     """Classification and search plan for an incoming user query."""
 
@@ -83,6 +88,18 @@ class ResearchPlan(BaseModel):
     )
     reasoning: str = Field(
         description="Brief explanation of why the query is or is not a research inquiry."
+    )
+    needs_clarification: bool = Field(
+        default=False,
+        description=(
+            "True ONLY if the user's research request is too vague or missing a subject "
+            "(e.g., 'Research it' or 'Compare the two' with no named technologies) and requires "
+            "human clarification before searching. False for any named topic or question."
+        ),
+    )
+    clarification_question: str | None = Field(
+        default=None,
+        description="Question to ask the user when needs_clarification is True.",
     )
 
 
@@ -147,11 +164,22 @@ def search_arxiv(query: str, max_results: int = 3) -> str:
     return "\n".join(results)
 
 
-# 1. Planner & Classifier Agent
+def requires_exhaustive_search_approval(max_results: int = 3, **_kwargs: object) -> bool:
+    """Requires human confirmation before running large literature sweeps (>5 papers)."""
+    return max_results > 5
+
+
+search_arxiv_tool = FunctionTool(
+    search_arxiv,
+    require_confirmation=requires_exhaustive_search_approval,
+)
+
+
+# 1. Planner & Classifier Agent (uses lightweight PLANNER_MODEL)
 query_planner_agent = LlmAgent(
     name="query_planner_agent",
     model=Gemini(
-        model=MODEL,
+        model=PLANNER_MODEL,
         retry_options=types.HttpRetryOptions(attempts=3),
     ),
     instruction=(
@@ -163,20 +191,25 @@ query_planner_agent = LlmAgent(
         "Non-research (unrelated) queries include:\n"
         "- Requests to write boilerplate code or solve pure math problems without a research topic\n"
         "- Casual greetings or small talk with no research topic\n\n"
-        "If it is a research query, generate 2 to 3 concise search queries (2-4 keywords each) and output using the ResearchPlan schema."
+        "If it is a research query, generate 2 to 3 concise search queries (2-4 keywords each) and output using the ResearchPlan schema. "
+        "Set needs_clarification=True only when the research prompt is completely missing a subject (e.g. 'research this for me')."
     ),
     output_schema=ResearchPlan,
 )
 
 
-def route_research(ctx: Context, node_input: dict | ResearchPlan) -> Event:
-    """Routes valid research plans to the researcher agent or declines off-topic prompts."""
+def route_research(ctx: Context, node_input: dict | ResearchPlan) -> Event | RequestInput:
+    """Routes valid research plans, pausing for human-in-the-loop input when clarification or plan approval is required."""
     if isinstance(node_input, dict):
         is_research = node_input.get("is_research_query", False)
         queries = node_input.get("search_queries", [])
+        needs_clarification = node_input.get("needs_clarification", False)
+        clarification_question = node_input.get("clarification_question")
     else:
         is_research = getattr(node_input, "is_research_query", False)
         queries = getattr(node_input, "search_queries", [])
+        needs_clarification = getattr(node_input, "needs_clarification", False)
+        clarification_question = getattr(node_input, "clarification_question", None)
 
     route = "research" if is_research else "unrelated"
 
@@ -184,20 +217,45 @@ def route_research(ctx: Context, node_input: dict | ResearchPlan) -> Event:
     if ctx.user_content and ctx.user_content.parts:
         user_text = "".join(p.text for p in ctx.user_content.parts if p.text)
 
+    state = getattr(ctx, "state", None) or {}
+    resume_inputs = getattr(ctx, "resume_inputs", None) or {}
+    require_plan_approval = bool(state.get("require_plan_approval", False))
+
+    # Programmatic HITL execution stop when a research query needs clarification
+    # or explicit plan approval before executing multi-source searches.
+    if route == "research" and (needs_clarification or require_plan_approval):
+        if "clarify_research_scope" not in resume_inputs:
+            planned_preview = ", ".join(queries) if queries else "none yet"
+            prompt_msg = clarification_question or (
+                f"Please confirm or refine the planned search queries before execution: {planned_preview}"
+            )
+            return RequestInput(
+                interrupt_id="clarify_research_scope",
+                message=prompt_msg,
+            )
+
+    clarification_reply = resume_inputs.get("clarify_research_scope")
     if route == "research" and queries:
         planned = ", ".join(queries)
         payload = f"User Question: {user_text}\nPlanned Search Queries: {planned}"
+        if clarification_reply:
+            payload += f"\nUser Clarification / Approval: {clarification_reply}"
+    elif route == "research" and clarification_reply:
+        payload = f"User Question: {user_text}\nUser Clarification / Approval: {clarification_reply}"
     else:
         payload = user_text or str(node_input)
 
     return Event(output=payload, route=route)
 
 
-# 2. Specialist Web Researcher Agent
+route_research_node = node(route_research, rerun_on_resume=True)
+
+
+# 2. Specialist Web Researcher Agent (uses higher-capacity RESEARCHER_MODEL)
 web_researcher_agent = LlmAgent(
     name="web_researcher_agent",
     model=Gemini(
-        model=MODEL,
+        model=RESEARCHER_MODEL,
         retry_options=types.HttpRetryOptions(attempts=3),
     ),
     instruction=(
@@ -220,7 +278,7 @@ web_researcher_agent = LlmAgent(
     tools=[
         GoogleSearchTool(bypass_multi_tools_limit=True),
         search_hackernews,
-        search_arxiv,
+        search_arxiv_tool,
         preload_memory,
     ],
     after_model_callback=[normalize_grounding_metadata_callback],
@@ -251,9 +309,9 @@ root_agent = Workflow(
     description="Multi-agent web research workflow that plans queries, searches live sources, and synthesizes cited briefs.",
     edges=[
         ("START", query_planner_agent),
-        (query_planner_agent, route_research),
+        (query_planner_agent, route_research_node),
         (
-            route_research,
+            route_research_node,
             {
                 "research": web_researcher_agent,
                 "unrelated": decline_node,
@@ -265,4 +323,6 @@ root_agent = Workflow(
 app = App(
     root_agent=root_agent,
     name="app",
+    resumability_config=ResumabilityConfig(is_resumable=True),
 )
+
