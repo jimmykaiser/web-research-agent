@@ -25,7 +25,14 @@ flowchart LR
    - `search_arxiv_tool` (`FunctionTool` with `require_confirmation=requires_exhaustive_search_approval`) — Queries the arXiv Atom API for scientific papers and enforces a **tool-level HITL confirmation gate** if an exhaustive sweep (`max_results > 5`) is requested.
    - `preload_memory` & `add_session_to_memory_callback` — Recalls and persists user preferences across sessions via Vertex AI Memory Bank.
 
+### Observability & Security Guardrails
+
+- **PII Redaction Pipeline (`redact_pii` + `scrub_pii_before_model_callback`)**: Deterministic regex redaction strips emails (`[REDACTED_EMAIL]`), phone numbers (`[REDACTED_PHONE]`), SSNs (`[REDACTED_SSN]`), and API keys/tokens (`[REDACTED_SECRET]`) from outgoing LLM prompts (`before_model_callback`), external API queries, and log payloads.
+- **Structured JSON Logging (`log_structured_event`)**: Emits single-line JSON records capturing **intent vs. outcome** (`workflow_routing`, `tool_execution`, `memory_persistence`, `pii_redaction_guardrail`) correlated with active OpenTelemetry `trace_id` and `span_id` fields.
+- **Explicit OpenTelemetry Custom Spans & Span Linking (`start_linked_span`)**: Wraps routing (`workflow.route_research`), external searches (`tool.search_hackernews`, `tool.search_arxiv`), and memory persistence (`memory.persist_session`) in custom spans explicitly linked across stages via `opentelemetry.trace.Link`.
+
 ## Quickstart
+
 
 ```bash
 # 1. Install dependencies

@@ -18,19 +18,28 @@ from unittest.mock import patch
 
 from google.adk.events.request_input import RequestInput
 from google.genai import types
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+import app.agent as agent_module
 from app.agent import (
     PLANNER_MODEL,
     RESEARCHER_MODEL,
     ResearchPlan,
     app,
     decline_node,
+    log_structured_event,
     normalize_grounding_metadata_callback,
     query_planner_agent,
+    redact_pii,
     requires_exhaustive_search_approval,
     route_research,
+    scrub_pii_before_model_callback,
     search_arxiv,
     search_hackernews,
+    start_linked_span,
     web_researcher_agent,
 )
 
@@ -152,4 +161,85 @@ def test_normalize_grounding_metadata_callback_coerces_dict() -> None:
     assert restored.model_dump(exclude_none=True, mode="json")["web_search_queries"] == [
         "RAG overview"
     ]
+
+
+def test_pii_redaction_and_before_model_guardrail() -> None:
+    raw = "Contact jane.doe@example.com or 415-555-0199 with SSN 123-45-6789 and key sk-1234567890abcdefghijklmno"
+    scrubbed = redact_pii(raw)
+    assert "jane.doe@example.com" not in scrubbed
+    assert "[REDACTED_EMAIL]" in scrubbed
+    assert "[REDACTED_PHONE]" in scrubbed
+    assert "[REDACTED_SSN]" in scrubbed
+    assert "[REDACTED_SECRET]" in scrubbed
+
+    llm_req = SimpleNamespace(
+        contents=[
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text="Email me at admin@corp.io about RAG")],
+            )
+        ]
+    )
+    scrub_pii_before_model_callback(SimpleNamespace(), llm_req)
+    assert llm_req.contents[0].parts[0].text == "Email me at [REDACTED_EMAIL] about RAG"
+
+
+def test_structured_logging_and_linked_otel_spans() -> None:
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    old_tracer = agent_module.tracer
+    agent_module.tracer = provider.get_tracer("test_web_research_agent")
+    agent_module._LAST_STAGE_SPAN_CONTEXT = None
+    try:
+        with start_linked_span("stage.one", attributes={"stage": 1}) as span1:
+            ctx1 = span1.get_span_context()
+            record = log_structured_event(
+                "test_event",
+                intent={"query": "email user@example.com"},
+                outcome={"status": "routed"},
+            )
+            assert record["intent"]["query"] == "email [REDACTED_EMAIL]"
+            assert record["outcome"]["status"] == "routed"
+            assert record["trace_id"] == f"{ctx1.trace_id:032x}"
+
+        with start_linked_span("stage.two", attributes={"stage": 2}):
+            pass
+
+        spans = exporter.get_finished_spans()
+        assert len(spans) == 2
+        assert spans[0].name == "stage.one"
+        assert spans[1].name == "stage.two"
+        assert len(spans[1].links) == 1
+        assert spans[1].links[0].context.span_id == spans[0].context.span_id
+    finally:
+        agent_module.tracer = old_tracer
+
+
+import asyncio
+
+
+def test_observability_and_privacy_plugin_registered_on_app() -> None:
+    assert len(app.plugins) == 1
+    plugin = app.plugins[0]
+    assert isinstance(plugin, agent_module.ObservabilityAndPrivacyPlugin)
+
+    msg = types.Content(
+        role="user",
+        parts=[types.Part.from_text(text="Reach me at bob@example.org")],
+    )
+    asyncio.run(
+        plugin.on_user_message_callback(invocation_context=None, user_message=msg)
+    )
+    assert msg.parts[0].text == "Reach me at [REDACTED_EMAIL]"
+
+    tool_args = {"query": "RAG papers by alice@university.edu"}
+    asyncio.run(
+        plugin.before_tool_callback(
+            tool=SimpleNamespace(name="search_arxiv"),
+            tool_args=tool_args,
+            tool_context=None,
+        )
+    )
+    assert tool_args["query"] == "RAG papers by [REDACTED_EMAIL]"
 
